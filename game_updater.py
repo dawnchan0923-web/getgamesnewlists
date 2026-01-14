@@ -14,7 +14,7 @@ GAMES = [
 ]
 
 KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季", "停服"]
-CHECK_RANGE_HOURS = 72  # 检查过去 3 天，确保有测试数据
+CHECK_RANGE_HOURS = 500  # 检查过去 3 天，确保有测试数据
 
 def get_news_list(game):
     results = []
