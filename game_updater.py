@@ -2,81 +2,78 @@ import requests
 import datetime
 import smtplib
 import re
+import json
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 核心配置：直接连接各游戏主官网 (DNS解析最稳) ---
+# --- 1. 核心配置 ---
 GAMES = [
-    {"name": "王者荣耀", "url": "https://pvp.qq.com/web201706/js/newsdata.js", "enc": "gbk"},
-    {"name": "和平精英", "url": "https://gp.qq.com/web201908/js/newsdata.js", "enc": "gbk"},
-    {"name": "无畏契约", "url": "https://val.qq.com/web202306/js/newsdata.js", "enc": "gbk"},
-    {"name": "穿越火线", "url": "https://cf.qq.com/web202004/js/news_data.js", "enc": "gbk"},
-    # 第五人格改用网易官方移动端通用接口
-    {"name": "第五人格", "url": "https://id5.163.com/news/index.html", "enc": "utf-8", "type": "html"},
+    {"name": "王者荣耀", "url": "https://pvp.qq.com/web201706/js/newsdata.js"},
+    {"name": "和平精英", "url": "https://gp.qq.com/web201908/js/newsdata.js"},
+    {"name": "无畏契约", "url": "https://val.qq.com/web202306/js/newsdata.js"},
+    {"name": "穿越火线", "url": "https://cf.qq.com/web202004/js/news_data.js"},
 ]
 
-KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季", "停服"]
-# 设置为 720 小时（30天），确保在测试阶段一定能抓到东西，确认“发信功能”正常
-CHECK_RANGE_HOURS = 720 
+KEYWORDS = ["更新", "维护", "版本", "公告", "赛季", "停服"]
+# 检查范围：设置为过去 10 天，确保测试时有数据
+CHECK_RANGE_HOURS = 240 
 
 def get_news(game):
     results = []
     print(f"🔍 正在连接: {game['name']}...")
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        # 增加 verify=False 防止 SSL 证书解析问题导致的 DNS 波动
-        r = requests.get(game['url'], headers=headers, timeout=20, verify=False)
-        r.encoding = game['enc']
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        # 强制不使用缓存，获取最新 JS
+        r = requests.get(game['url'], headers=headers, timeout=15, verify=False)
         content = r.text
 
-        if not content:
-            print("   ⚠️ 返回内容为空")
-            return []
+        # 诊断：打印前100个字符看看格式
+        print(f"   📊 数据快照: {content[:100]}...")
 
-        # 暴力提取模式：不再尝试转JSON，直接用正则抠出所有的标题和日期
-        # 腾讯系 JS 逻辑
-        if ".js" in game['url']:
-            # 匹配 sTitle:"..." 或 sTitle:'...'
-            titles = re.findall(r'sTitle\s*:\s*["\'](.*?)["\']', content)
-            dates = re.findall(r'sIdxTime\s*:\s*["\'](.*?)["\']', content)
-            urls = re.findall(r'(?:sRedirectURL|vLink|sUrl)\s*:\s*["\'](.*?)["\']', content)
-            
-            print(f"   ✅ 抓取到 {len(titles)} 条潜在公告")
-            
-            now = datetime.datetime.now()
-            for i in range(min(len(titles), 20)): # 只看最新的20条
-                t, d = titles[i], dates[i] if i < len(dates) else ""
-                u = urls[i] if i < len(urls) else ""
-                
-                if not d: continue
-                try:
-                    p_time = datetime.datetime.strptime(d, '%Y-%m-%d %H:%M:%S')
-                    if (now - p_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
-                        if any(kw in t for kw in KEYWORDS):
-                            link = "https:" + u if u.startswith('//') else u
-                            results.append(f"【{game['name']}】{t}\n链接: {link}")
-                except: continue
+        # 1. 提取所有标题、时间和链接
+        # 腾讯格式通常是 "sTitle":"...", "sIdxTime":"..."
+        titles = re.findall(r'sTitle["\']?\s*:\s*["\'](.*?)["\']', content)
+        dates = re.findall(r'sIdxTime["\']?\s*:\s*["\'](.*?)["\']', content)
+        urls = re.findall(r'(?:sRedirectURL|vLink|sUrl)["\']?\s*:\s*["\'](.*?)["\']', content)
+        
+        print(f"   ✅ 抓取到 {len(titles)} 条原始记录")
 
-        # 针对第五人格等 HTML 页面做简单处理
-        elif game.get("type") == "html":
-            # 简单抠取 HTML 里的标题
-            items = re.findall(r'<a.*?>(.*?)更新(.*?)</a>', content)
-            if items:
-                results.append(f"【{game['name']}】发现更新相关公告，请前往官网查看\n链接: {game['url']}")
+        now = datetime.datetime.now()
+        for i in range(len(titles)):
+            # --- 关键步骤：处理 Unicode 转义 ---
+            # 把 \u66f4\u65b0 这种转成真正的中文
+            raw_title = titles[i]
+            try:
+                clean_title = raw_title.encode('utf-8').decode('unicode_escape')
+            except:
+                clean_title = raw_title # 如果解析失败就用原样
+
+            raw_date = dates[i] if i < len(dates) else ""
+            raw_url = urls[i] if i < len(urls) else ""
+            
+            if not raw_date: continue
+            
+            try:
+                p_time = datetime.datetime.strptime(raw_date, '%Y-%m-%d %H:%M:%S')
+                # 2. 判断时间与关键词
+                if (now - p_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                    if any(kw in clean_title for kw in KEYWORDS):
+                        link = "https:" + raw_url if raw_url.startswith('//') else raw_url
+                        results.append(f"【{game['name']}】{clean_title}\n链接: {link}")
+            except:
+                continue
 
     except Exception as e:
-        print(f"   ❌ 访问失败: {e}")
+        print(f"   ❌ 失败: {e}")
         
     return results
 
 def send_email(content_list, smtp):
     if not content_list:
-        print("\n📢 结果：由于 DNS 或屏蔽原因，依然未能获取有效数据。")
+        print("\n📢 诊断结果：数据已抓取，但解码后仍未匹配到关键词。请检查关键词设置。")
         return
     
-    body = "游戏更新自动监控报告（测试模式-30天范围）：\n\n" + "\n\n".join(content_list)
+    body = "游戏更新自动监控报告（测试覆盖10天内容）：\n\n" + "\n\n".join(content_list)
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['From'] = smtp['user']
     msg['To'] = smtp['user']
@@ -102,8 +99,8 @@ if __name__ == "__main__":
         'password': os.environ.get('MAIL_PASS')
     }
     
-    final = []
+    final_results = []
     for g in GAMES:
-        final.extend(get_news(g))
+        final_results.extend(get_news(g))
     
-    send_email(final, conf)
+    send_email(final_results, conf)
