@@ -1,79 +1,70 @@
 import requests
 import datetime
 import smtplib
-import re
 import json
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 核心配置 ---
+# --- 1. 核心配置：各游戏 B 站官号的 UID ---
+# 获取 UID 方法：去 B 站搜索官号，空间主页 URL 里的数字就是 UID
 GAMES = [
-    {"name": "王者荣耀", "url": "https://pvp.qq.com/web201706/js/newsdata.js"},
-    {"name": "和平精英", "url": "https://gp.qq.com/web201908/js/newsdata.js"},
-    {"name": "无畏契约", "url": "https://val.qq.com/web202306/js/newsdata.js"},
-    {"name": "穿越火线", "url": "https://cf.qq.com/web202004/js/news_data.js"},
+    {"name": "王者荣耀", "uid": "5780482"},
+    {"name": "和平精英", "uid": "311027170"},
+    {"name": "无畏契约", "uid": "1478516035"},
+    {"name": "穿越火线", "uid": "11132514"},
+    {"name": "第五人格", "uid": "271502434"},
+    {"name": "超自然行动", "uid": "3546654013446051"}, # 官号：超自然行动
 ]
 
 KEYWORDS = ["更新", "维护", "版本", "公告", "赛季", "停服"]
-# 检查范围：设置为过去 10 天，确保测试时有数据
-CHECK_RANGE_HOURS = 240 
+CHECK_RANGE_HOURS = 48 # 检查过去 48 小时
 
-def get_news(game):
+def get_bili_news(game):
     results = []
-    print(f"🔍 正在连接: {game['name']}...")
+    print(f"🔍 正在检查 B 站官号: {game['name']}...")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        # 强制不使用缓存，获取最新 JS
-        r = requests.get(game['url'], headers=headers, timeout=15, verify=False)
-        content = r.text
-
-        # 诊断：打印前100个字符看看格式
-        print(f"   📊 数据快照: {content[:100]}...")
-
-        # 1. 提取所有标题、时间和链接
-        # 腾讯格式通常是 "sTitle":"...", "sIdxTime":"..."
-        titles = re.findall(r'sTitle["\']?\s*:\s*["\'](.*?)["\']', content)
-        dates = re.findall(r'sIdxTime["\']?\s*:\s*["\'](.*?)["\']', content)
-        urls = re.findall(r'(?:sRedirectURL|vLink|sUrl)["\']?\s*:\s*["\'](.*?)["\']', content)
+        # B 站公开动态接口
+        url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={game['uid']}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://www.bilibili.com/'
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
         
-        print(f"   ✅ 抓取到 {len(titles)} 条原始记录")
+        items = data.get('data', {}).get('items', [])
+        print(f"   ✅ 成功连接！获取到 {len(items)} 条动态记录")
 
         now = datetime.datetime.now()
-        for i in range(len(titles)):
-            # --- 关键步骤：处理 Unicode 转义 ---
-            # 把 \u66f4\u65b0 这种转成真正的中文
-            raw_title = titles[i]
+        for item in items:
+            # 提取动态文字内容
             try:
-                clean_title = raw_title.encode('utf-8').decode('unicode_escape')
-            except:
-                clean_title = raw_title # 如果解析失败就用原样
-
-            raw_date = dates[i] if i < len(dates) else ""
-            raw_url = urls[i] if i < len(urls) else ""
-            
-            if not raw_date: continue
-            
-            try:
-                p_time = datetime.datetime.strptime(raw_date, '%Y-%m-%d %H:%M:%S')
-                # 2. 判断时间与关键词
-                if (now - p_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
-                    if any(kw in clean_title for kw in KEYWORDS):
-                        link = "https:" + raw_url if raw_url.startswith('//') else raw_url
-                        results.append(f"【{game['name']}】{clean_title}\n链接: {link}")
+                desc = item.get('modules', {}).get('module_dynamic', {}).get('desc', {}).get('text', '')
+                pub_time_raw = item.get('modules', {}).get('module_author', {}).get('pub_ts', 0)
+                pub_time = datetime.datetime.fromtimestamp(pub_time_raw)
+                id_str = item.get('id_str', '')
+                link = f"https://t.bilibili.com/{id_str}"
+                
+                # 时间和关键词匹配
+                if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                    if any(kw in desc for kw in KEYWORDS):
+                        # 截取前 50 个字符作为标题
+                        title = desc.split('\n')[0][:50]
+                        results.append(f"【{game['name']}】{title}\n链接: {link}")
             except:
                 continue
-
+                
     except Exception as e:
-        print(f"   ❌ 失败: {e}")
+        print(f"   ❌ 抓取失败: {e}")
         
-    return results
+    return list(set(results)) # 去重
 
 def send_email(content_list, smtp):
     if not content_list:
-        print("\n📢 诊断结果：数据已抓取，但解码后仍未匹配到关键词。请检查关键词设置。")
+        print("\n📢 结果：B 站接口通畅，但过去 48 小时无更新相关动态。")
         return
     
-    body = "游戏更新自动监控报告（测试覆盖10天内容）：\n\n" + "\n\n".join(content_list)
+    body = "游戏更新自动监控报告（数据源：B站官号动态）：\n\n" + "\n\n".join(content_list)
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['From'] = smtp['user']
     msg['To'] = smtp['user']
@@ -84,23 +75,20 @@ def send_email(content_list, smtp):
         s.login(smtp['user'], smtp['password'])
         s.sendmail(smtp['user'], [smtp['user']], msg.as_string())
         s.quit()
-        print("\n🚀 邮件已发送！请查收。")
+        print("\n🚀 邮件已成功发送！")
     except Exception as e:
-        print(f"\n❌ 发信失败: {e}")
+        print(f"\n❌ 邮件发送失败: {e}")
 
 if __name__ == "__main__":
     import os
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
     conf = {
         'host': 'smtp.qq.com',
         'user': os.environ.get('MAIL_USER'),
         'password': os.environ.get('MAIL_PASS')
     }
     
-    final_results = []
+    all_news = []
     for g in GAMES:
-        final_results.extend(get_news(g))
+        all_news.extend(get_bili_news(g))
     
-    send_email(final_results, conf)
+    send_email(all_news, conf)
