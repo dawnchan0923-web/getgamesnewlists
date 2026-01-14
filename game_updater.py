@@ -2,23 +2,47 @@ import feedparser
 import datetime
 import smtplib
 import time
+import requests
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 游戏列表配置 ---
-# 换成了更稳定的镜像地址 rsshub.moeyy.cn
-BASE_URL = "https://rsshub.moeyy.cn" 
-
+# --- 1. 游戏列表配置 (改用 TapTap 官方公告源，更稳定) ---
+# 这里的 ID 是各游戏在 TapTap 的官方编号
 GAMES = [
-    {"name": "王者荣耀", "rss_url": f"{BASE_URL}/tencent/pvp/news/index"},
-    {"name": "和平精英", "rss_url": f"{BASE_URL}/tencent/gp/news/all"},
-    {"name": "无畏契约", "rss_url": f"{BASE_URL}/tencent/val/news"},
-    {"name": "穿越火线", "rss_url": f"{BASE_URL}/tencent/cf/news/all"},
-    {"name": "第五人格", "rss_url": f"{BASE_URL}/netease/ds/id5"},
+    {"name": "王者荣耀", "id": "18103"},
+    {"name": "和平精英", "id": "70056"},
+    {"name": "无畏契约", "id": "213506"},
+    {"name": "穿越火线", "id": "11046"},
+    {"name": "第五人格", "id": "35915"},
+    {"name": "超自然行动", "id": "380482"}, # 新增你提到的超自然行动
 ]
 
-KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季"]
-CHECK_RANGE_HOURS = 72  # 调试阶段建议先改成 72 小时（3天），确保能抓到东西
+# 备选镜像站列表，提高稳定性
+MIRRORS = [
+    "https://rsshub.rss.how",
+    "https://rsshub.moeyy.cn",
+    "https://hub.anyway.run"
+]
+
+KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季", "停服"]
+CHECK_RANGE_HOURS = 72 # 强制检查3天内，确保有内容
+
+def fetch_rss(game_name, game_id):
+    for mirror in MIRRORS:
+        url = f"{mirror}/taptap/topic/{game_id}/official"
+        print(f"  正在尝试镜像 {mirror} ...")
+        try:
+            # 增加 User-Agent 伪装
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                feed = feedparser.parse(response.text)
+                if feed.entries:
+                    return feed.entries
+            print(f"  ⚠️ 镜像 {mirror} 返回数据为空或报错")
+        except Exception as e:
+            print(f"  ❌ 镜像 {mirror} 访问失败: {e}")
+    return []
 
 def get_game_updates():
     summary_list = []
@@ -26,42 +50,32 @@ def get_game_updates():
 
     for game in GAMES:
         print(f"正在检查: {game['name']}...")
-        try:
-            # 增加请求头模拟浏览器，防止被封
-            feed = feedparser.parse(game['rss_url'])
+        entries = fetch_rss(game['name'], game['id'])
+        
+        if not entries:
+            print(f"  🚫 {game['name']} 所有镜像均失效。")
+            continue
             
-            if not feed.entries:
-                print(f"  ⚠️ 未能从 {game['name']} 抓取到任何内容，可能是接口维护或被拦截。")
-                continue
-                
-            print(f"  ✅ 发现 {len(feed.entries)} 条原始公告，开始关键词过滤...")
+        print(f"  ✅ 成功获取 {len(entries)} 条公告，正在匹配关键词...")
+        for entry in entries:
+            pub_time = None
+            if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
             
-            for entry in feed.entries:
-                # 尝试获取发布时间
-                pub_time = None
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-                
-                # 如果没抓到时间，默认给个现在的时间让它通过过滤
-                if not pub_time:
-                    pub_time = now
+            if not pub_time: pub_time = now
 
-                # 逻辑判断：时间范围 + 关键词
-                hours_diff = (now - pub_time).total_seconds() / 3600
-                if hours_diff < CHECK_RANGE_HOURS:
-                    if any(kw.lower() in entry.title.lower() for kw in KEYWORDS):
-                        summary_list.append(f"【{game['name']}】{entry.title}\n链接: {entry.link}")
-        except Exception as e:
-            print(f"  ❌ 抓取 {game['name']} 出错: {e}")
+            if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                if any(kw.lower() in entry.title.lower() for kw in KEYWORDS):
+                    summary_list.append(f"【{game['name']}】{entry.title}\n链接: {entry.link}")
             
     return summary_list
 
 def send_email(content_list, smtp_config):
     if not content_list:
-        print("今日无符合条件的更新内容，跳过发送邮件。")
+        print("今日无符合条件的更新公告。")
         return
 
-    mail_content = "为您汇总以下游戏更新动态：\n\n" + "\n\n".join(content_list)
+    mail_content = "为您汇总以下游戏更新动态（测试模式）：\n\n" + "\n\n".join(content_list)
     msg = MIMEText(mail_content, 'plain', 'utf-8')
     msg['From'] = smtp_config['sender']
     msg['To'] = smtp_config['receiver']
@@ -72,7 +86,7 @@ def send_email(content_list, smtp_config):
         server.login(smtp_config['user'], smtp_config['password'])
         server.sendmail(smtp_config['sender'], [smtp_config['receiver']], msg.as_string())
         server.quit()
-        print("🚀 邮件发送成功！")
+        print("🚀 邮件发送成功！请检查收件箱或垃圾箱。")
     except Exception as e:
         print(f"❌ 邮件发送失败: {e}")
 
@@ -85,6 +99,5 @@ if __name__ == "__main__":
         'sender': os.environ.get('MAIL_USER'),
         'receiver': os.environ.get('MAIL_USER')
     }
-    
     updates = get_game_updates()
     send_email(updates, SMTP_CONFIG)
