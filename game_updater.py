@@ -5,7 +5,7 @@ import urllib.parse
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 配置：需要监控的游戏列表 ---
+# --- 1. 配置 ---
 GAMES = ["王者荣耀", "和平精英", "无畏契约", "穿越火线", "第五人格", "超自然行动"]
 KEYWORDS = ["更新", "维护", "公告", "版本", "赛季"]
 CHECK_RANGE_HOURS = 24 
@@ -13,60 +13,108 @@ CHECK_RANGE_HOURS = 24
 def get_google_news_updates():
     results = []
     now = datetime.datetime.now(datetime.timezone.utc)
+    
     for game in GAMES:
         print(f"🔍 正在检索: {game}...")
         keyword_query = ' OR '.join(['"{}"'.format(kw) for kw in KEYWORDS])
         query = '{} ({})'.format(game, keyword_query)
         encoded_query = urllib.parse.quote(query)
         rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+        
         try:
             feed = feedparser.parse(rss_url)
             for entry in feed.entries:
-                if not hasattr(entry, 'published_parsed') or not entry.published_parsed: continue
+                if not hasattr(entry, 'published_parsed') or not entry.published_parsed:
+                    continue
                 pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
+                
                 if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
                     if game in entry.title:
-                        source = entry.source.get('title', '未知')
-                        results.append(f"【{game}】{entry.title}\n链接: {entry.link}")
+                        # 存储为字典，方便后续生成 HTML
+                        results.append({
+                            "game": game,
+                            "title": entry.title,
+                            "link": entry.link,
+                            "source": entry.source.get('title', '未知来源'),
+                            "time": pub_time.strftime('%Y-%m-%d %H:%M')
+                        })
         except Exception as e:
             print(f"   ❌ 检索失败: {e}")
-    return list(set(results))
+            
+    return results
 
-def send_email(content_list, smtp):
-    if not content_list:
+def send_email(news_items, smtp):
+    if not news_items:
         print("\n📢 今日无更新。")
         return
     
     today = datetime.date.today()
-    body = f"游戏更新汇总（{today}）：\n\n" + "\n\n".join(content_list)
-    msg = MIMEText(body, 'plain', 'utf-8')
+    
+    # --- 2. 构造 HTML 内容 ---
+    html_body = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: 'Microsoft YaHei', sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px; }}
+            .header {{ background-color: #f8f9fa; padding: 10px 20px; border-bottom: 3px solid #007bff; border-radius: 10px 10px 0 0; }}
+            .game-tag {{ background: #007bff; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-right: 10px; }}
+            .item {{ margin-bottom: 20px; padding: 15px; border-bottom: 1px solid #f0f0f0; }}
+            .title {{ font-size: 16px; font-weight: bold; color: #0056b3; text-decoration: none; }}
+            .footer {{ font-size: 12px; color: #999; margin-top: 20px; text-align: center; }}
+            .meta {{ font-size: 12px; color: #666; margin-top: 5px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2>🎮 游戏更新情报汇总</h2>
+                <p style="color: #666;">日期：{today}</p>
+            </div>
+    """
+
+    for item in news_items:
+        html_body += f"""
+            <div class="item">
+                <span class="game-tag">{item['game']}</span>
+                <a class="title" href="{item['link']}" target="_blank">{item['title']}</a>
+                <div class="meta">来源：{item['source']} | 时间：{item['time']}</div>
+            </div>
+        """
+
+    html_body += """
+            <div class="footer">
+                此邮件由 GitHub Actions 自动化工作流发送<br>
+                数据聚合自 Google News RSS
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    # --- 3. 发送设置 ---
+    # 注意这里将 'plain' 改成了 'html'
+    msg = MIMEText(html_body, 'html', 'utf-8')
     msg['From'] = smtp['user']
     msg['To'] = smtp['user']
-    msg['Subject'] = Header(f"游戏更新汇总 - {today}", 'utf-8')
+    msg['Subject'] = Header(f"🎮 游戏更新情报汇总 - {today}", 'utf-8')
 
-    print(f"📧 正在尝试通过网易邮箱 ({smtp['host']}) 发送...")
-    
     try:
-        # 网易邮箱强制要求使用 SSL 465 端口
         server = smtplib.SMTP_SSL(smtp['host'], 465, timeout=30)
-        # server.set_debuglevel(1) # 如果还是不行，取消此行注释看详细报错
         server.login(smtp['user'], smtp['password'])
         server.sendmail(smtp['user'], [smtp['user']], msg.as_string())
         server.quit()
-        print("\n🚀 网易邮箱发送成功！")
+        print("\n🚀 HTML 格式邮件已成功发送！")
     except Exception as e:
-        print(f"\n❌ 发送失败。错误原因: {e}")
-        print("提示：请确认 MAIL_PASS 是16位授权码，且 host 匹配（163或126）。")
+        print(f"\n❌ 发送失败: {e}")
 
 if __name__ == "__main__":
     import os
-    # --- 关键修改区 ---
-    # 如果你是 126 邮箱，请把 smtp.163.com 改为 smtp.126.com
     conf = {
-        'host': 'smtp.163.com', 
-        'user': os.environ.get('MAIL_USER'),     # 填你的完整网易邮箱地址
-        'password': os.environ.get('MAIL_PASS')  # 填刚才获取的16位授权码
+        'host': 'smtp.163.com',
+        'user': os.environ.get('MAIL_USER'),
+        'password': os.environ.get('MAIL_PASS')
     }
     
-    updates = get_google_news_updates()
-    send_email(updates, conf)
+    news_data = get_google_news_updates()
+    send_email(news_data, conf)
