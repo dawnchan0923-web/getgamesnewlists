@@ -2,121 +2,101 @@ import feedparser
 import datetime
 import smtplib
 import urllib.parse
-import requests
 import re
-import json
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 核心配置 ---
-# 格式：{ "游戏名": "TapTap_ID" (如果没有则填 None) }
-GAMES_CONFIG = {
-    "王者荣耀": "18103",
-    "和平精英": "70056",
-    "无畏契约": "213506",
-    "穿越火线": "11046",
-    "第五人格": "35915",
-    "超自然行动": "380482"
-}
+# --- 1. 配置：游戏与官方域名定义 ---
+# 我们通过强制 site 搜索来确保信息的纯净度
+GAMES = ["王者荣耀", "和平精英", "无畏契约", "穿越火线", "第五人格", "超自然行动"]
+
+# 官方域名白名单（用于强制搜索和权威标记）
+OFFICIAL_SITES = ["qq.com", "163.com", "taptap.cn", "bilibili.com", "weibo.com", "val.qq.com", "pvp.qq.com"]
 
 KEYWORDS = ["更新", "维护", "公告", "版本", "赛季", "停服"]
-BLACKLIST = ["爆料", "八卦", "盘点", "攻略", "玩家吐槽", "传闻", "泄露", "教学", "壁纸"]
-OFFICIAL_DOMAINS = ["qq.com", "taptap.cn", "163.com", "bilibili.com", "weibo.com"]
+BLACKLIST = ["爆料", "八卦", "盘点", "攻略", "玩家吐槽", "传闻", "教学", "壁纸", "测评"]
+
+# 匹配版本号的正则：如 v1.2, 2.0版本, 第35赛季, S35
+VERSION_PATTERN = r'[vV]?\d+\.\d+\.?\d*|[第]?\s*\d+\s*[版本|赛季|Season|阶段]'
 
 CHECK_RANGE_HOURS = 24
 
-# --- 2. 核心功能函数 ---
+# --- 2. 逻辑函数 ---
 
 def get_beijing_time():
-    """获取北京时间"""
     return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
 
-def format_relative_time(pub_time):
-    """计算相对时间字符串"""
-    now = get_beijing_time()
-    # 统一时区进行计算
-    delta = now - pub_time.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
-    hours = int(delta.total_seconds() / 3600)
-    if hours < 1:
-        return "刚刚"
-    return f"{hours}小时前"
+def extract_version(title):
+    """提取版本号标记"""
+    match = re.search(VERSION_PATTERN, title)
+    return f"[{match.group().strip()}] " if match else ""
 
 def is_official(url):
     """通过域名判断是否为官方源"""
-    return any(domain in url.lower() for domain in OFFICIAL_DOMAINS)
+    return any(domain in url.lower() for domain in OFFICIAL_SITES)
 
-def clean_and_filter(items):
-    """去重及黑名单过滤"""
-    seen_titles = set()
-    unique_items = []
-    for item in items:
-        # 1. 黑名单过滤
-        if any(word in item['title'] for word in BLACKLIST):
-            continue
-        # 2. 标题相似度去重（取前15个字符）
-        title_summary = item['title'][:15]
-        if title_summary in seen_titles:
-            continue
-        seen_titles.add(title_summary)
-        unique_items.append(item)
-    return unique_items
-
-def fetch_from_google(game_name):
-    """从 Google News 获取数据"""
+def fetch_game_news(game_name):
+    """
+    双重搜索逻辑：
+    1. 强制搜索官方域名下的该游戏公告
+    2. 搜索全网公告作为补充
+    """
     results = []
-    # 修正 f-string 语法：先在外部处理好关键字查询字符串
-    keyword_query = ' OR '.join(['"{}"'.format(kw) for kw in KEYWORDS])
-    query = '{} ({})'.format(game_name, keyword_query)
     
+    # 构造高级搜索指令
+    # 逻辑：游戏名 + 关键词 + (site:官方域名1 OR site:官方域名2...)
+    kw_query = ' OR '.join(['"{}"'.format(kw) for kw in KEYWORDS])
+    site_query = ' OR '.join(['site:{}'.format(site) for site in OFFICIAL_SITES])
+    
+    # 混合搜索：优先搜官方，同时也搜全网
+    query = f'{game_name} ({kw_query}) ({site_query} OR "官方")'
     encoded_query = urllib.parse.quote(query)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
     
     try:
         feed = feedparser.parse(rss_url)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
         for entry in feed.entries:
             if not hasattr(entry, 'published_parsed') or not entry.published_parsed:
                 continue
+            
             pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-            if (datetime.datetime.now(datetime.timezone.utc) - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
-                if game_name in entry.title:
+            
+            # 时间过滤
+            if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                title = entry.title
+                # 排除黑名单
+                if any(word in title for word in BLACKLIST):
+                    continue
+                # 确保标题包含游戏名
+                if game_name in title:
+                    url = entry.link
                     results.append({
-                        "title": entry.title,
-                        "link": entry.link,
-                        "source": entry.source.get('title', '全网聚合'),
+                        "game": game_name,
+                        "title": title,
+                        "link": url,
+                        "source": entry.source.get('title', '全网'),
                         "time": pub_time,
-                        "is_official": is_official(entry.link)
+                        "official": is_official(url),
+                        "version_tag": extract_version(title)
                     })
     except Exception as e:
-        print(f"   ⚠️ Google News 抓取失败 ({game_name}): {e}")
-    return results
+        print(f"   ⚠️ {game_name} 抓取异常: {e}")
+    
+    # 简单去重
+    unique_news = []
+    seen = set()
+    for n in results:
+        if n['title'][:15] not in seen:
+            unique_news.append(n)
+            seen.add(n['title'][:15])
+    
+    # 排序：官方置顶
+    unique_news.sort(key=lambda x: x['official'], reverse=True)
+    return unique_news
 
-def fetch_from_taptap(game_name, app_id):
-    """从 TapTap 官方社区获取数据（作为补充）"""
-    results = []
-    if not app_id: return results
-    # TapTap 官方公告 API
-    url = f"https://www.taptap.cn/web-api/tds-forum/v1/categories/official/topics?app_id={app_id}&limit=5"
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, headers=headers, timeout=10).json()
-        items = resp.get('data', {}).get('list', [])
-        for item in items:
-            topic_data = item.get('topic', {})
-            title = topic_data.get('title', '')
-            if any(kw in title for kw in KEYWORDS):
-                topic_id = topic_data.get('id')
-                results.append({
-                    "title": title,
-                    "link": f"https://www.taptap.cn/moment/{topic_id}",
-                    "source": "TapTap官方社区",
-                    "time": datetime.datetime.now(datetime.timezone.utc), 
-                    "is_official": True
-                })
-    except Exception as e:
-        print(f"   ⚠️ TapTap 抓取失败 ({game_name}): {e}")
-    return results
-
-# --- 3. 邮件模板生成 ---
+# --- 3. HTML 模板 ---
 
 def generate_html(all_data):
     today = datetime.date.today()
@@ -124,47 +104,53 @@ def generate_html(all_data):
     <html>
     <head>
         <style>
-            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; }}
-            .container {{ max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); overflow: hidden; }}
-            .header {{ background: #1a73e8; color: white; padding: 25px; text-align: center; }}
-            .game-section {{ padding: 20px; border-bottom: 1px solid #eee; }}
-            .game-title {{ font-size: 18px; font-weight: bold; color: #1a73e8; margin-bottom: 15px; padding-left: 10px; border-left: 4px solid #1a73e8; }}
-            .news-item {{ display: block; padding: 12px; margin-bottom: 8px; background: #fafafa; border-radius: 6px; text-decoration: none; border: 1px solid #f0f0f0; }}
-            .news-title {{ color: #202124; font-size: 14px; font-weight: 500; display: block; margin-bottom: 5px; }}
-            .badge-official {{ display: inline-block; background: #e6f4ea; color: #1e8e3e; font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-right: 6px; }}
-            .meta {{ font-size: 11px; color: #70757a; }}
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f6f8fa; margin: 0; padding: 20px; }}
+            .card {{ max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); overflow: hidden; }}
+            .header {{ background: #0366d6; color: white; padding: 20px; text-align: center; }}
+            .section {{ padding: 15px 20px; border-bottom: 1px solid #e1e4e8; }}
+            .game-name {{ font-size: 18px; font-weight: bold; color: #0366d6; margin-bottom: 12px; display: flex; align-items: center; }}
+            .news-link {{ display: block; text-decoration: none; padding: 10px; margin: 5px 0; border-radius: 6px; background: #fff; border: 1px solid #f1f1f1; }}
+            .news-link:hover {{ background: #fbfbfb; border-color: #0366d6; }}
+            .v-tag {{ color: #d73a49; font-weight: bold; font-size: 13px; }}
+            .title-text {{ color: #24292e; font-size: 14px; line-height: 1.5; }}
+            .badge-off {{ background: #28a745; color: white; font-size: 10px; padding: 1px 4px; border-radius: 3px; margin-right: 5px; }}
+            .meta {{ font-size: 11px; color: #586069; margin-top: 6px; }}
             .empty {{ font-size: 13px; color: #999; padding: 10px; }}
-            .footer {{ padding: 20px; font-size: 11px; color: #999; text-align: center; line-height: 1.5; }}
+            .footer {{ padding: 20px; text-align: center; font-size: 11px; color: #6a737d; }}
         </style>
     </head>
     <body>
-        <div class="container">
+        <div class="card">
             <div class="header">
-                <h2 style="margin:0;">🎮 游戏情报分类简报</h2>
-                <div style="font-size:12px; margin-top:5px; opacity:0.9;">生成时间: {get_beijing_time().strftime('%Y-%m-%d %H:%M')}</div>
+                <h2 style="margin:0;">🎯 游戏更新深度日报</h2>
+                <div style="font-size:12px; margin-top:5px; opacity:0.8;">{get_beijing_time().strftime('%Y-%m-%d %H:%M')} | 官方优先模式已开启</div>
             </div>
     """
     
-    for game, news in all_data.items():
-        html += f'<div class="game-section"><div class="game-title">{game}</div>'
-        if not news:
-            html += '<div class="empty">今日暂无匹配的更新公告</div>'
+    for game in GAMES:
+        news_list = all_data.get(game, [])
+        html += f'<div class="section"><div class="game-name"># {game}</div>'
+        
+        if not news_list:
+            html += '<div class="empty">今日暂无官方及相关更新公告</div>'
         else:
-            for item in news:
-                official_badge = '<span class="badge-official">官方</span>' if item['is_official'] else ''
-                rel_time = format_relative_time(item['time'])
+            for item in news_list:
+                off_icon = '<span class="badge-off">官方</span>' if item['official'] else ''
+                v_tag = f'<span class="v-tag">{item["version_tag"]}</span>' if item['version_tag'] else ''
+                pub_time_str = item['time'].astimezone(datetime.timezone(datetime.timedelta(hours=8))).strftime('%H:%M')
+                
                 html += f"""
-                <a class="news-item" href="{item['link']}">
-                    <span class="news-title">{official_badge}{item['title']}</span>
-                    <span class="meta">{item['source']} • {rel_time}</span>
+                <a class="news-link" href="{item['link']}">
+                    <div class="title-text">{off_icon}{v_tag}{item['title']}</div>
+                    <div class="meta">{item['source']} • {pub_time_str} 发布</div>
                 </a>
                 """
         html += '</div>'
 
     html += """
             <div class="footer">
-                系统已自动排除八卦、爆料及重复信息<br>
-                Powered by GitHub Actions • 数据源：Google News & TapTap
+                情报来源说明：系统优先检索游戏官网及B站/TapTap官号内容。<br>
+                [官方] 标记代表链接直达腾讯/网易/B站官方域名。
             </div>
         </div>
     </body>
@@ -172,7 +158,7 @@ def generate_html(all_data):
     """
     return html
 
-# --- 4. 主逻辑 ---
+# --- 4. 执行 ---
 
 if __name__ == "__main__":
     import os
@@ -182,36 +168,23 @@ if __name__ == "__main__":
         'password': os.environ.get('MAIL_PASS')
     }
 
-    all_game_data = {}
+    final_report = {}
+    for game in GAMES:
+        print(f"🚀 检索中: {game}...")
+        final_report[game] = fetch_game_news(game)
 
-    for game_name, app_id in GAMES_CONFIG.items():
-        # 1. 获取 Google 数据
-        raw_news = fetch_from_google(game_name)
-        
-        # 2. 如果结果较少，使用 TapTap 补货
-        if len(raw_news) < 2:
-            raw_news.extend(fetch_from_taptap(game_name, app_id))
-            
-        # 3. 过滤与清洗
-        filtered_news = clean_and_filter(raw_news)
-        
-        # 4. 排序：官方置顶
-        filtered_news.sort(key=lambda x: x['is_official'], reverse=True)
-        
-        all_game_data[game_name] = filtered_news
-
-    # 5. 生成 HTML 并发送
-    html_content = generate_html(all_game_data)
-    msg = MIMEText(html_content, 'html', 'utf-8')
+    # 发送
+    html_report = generate_html(final_report)
+    msg = MIMEText(html_report, 'html', 'utf-8')
     msg['From'] = conf['user']
     msg['To'] = conf['user']
-    msg['Subject'] = Header(f"🎮 游戏更新分类情报 - {datetime.date.today()}", 'utf-8')
+    msg['Subject'] = Header(f"🎮 游戏更新日报 - {datetime.date.today()}", 'utf-8')
 
     try:
         server = smtplib.SMTP_SSL(conf['host'], 465, timeout=30)
         server.login(conf['user'], conf['password'])
         server.sendmail(conf['user'], [conf['user']], msg.as_string())
         server.quit()
-        print("🚀 分类情报日报发送成功！")
+        print("✅ 日报发送成功！")
     except Exception as e:
-        print(f"❌ 邮件发送失败: {e}")
+        print(f"❌ 发送失败: {e}")
