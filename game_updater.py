@@ -1,81 +1,65 @@
-import feedparser
+import requests
+import json
 import datetime
 import smtplib
-import time
-import requests
+import re
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 游戏列表配置 (改用 TapTap 官方公告源，更稳定) ---
-# 这里的 ID 是各游戏在 TapTap 的官方编号
+# --- 1. 核心配置：直接指向官方数据源 ---
+# 腾讯游戏大多使用这个数据存储格式
 GAMES = [
-    {"name": "王者荣耀", "id": "18103"},
-    {"name": "和平精英", "id": "70056"},
-    {"name": "无畏契约", "id": "213506"},
-    {"name": "穿越火线", "id": "11046"},
-    {"name": "第五人格", "id": "35915"},
-    {"name": "超自然行动", "id": "380482"}, # 新增你提到的超自然行动
-]
-
-# 备选镜像站列表，提高稳定性
-MIRRORS = [
-    "https://rsshub.rss.how",
-    "https://rsshub.moeyy.cn",
-    "https://hub.anyway.run"
+    {"name": "王者荣耀", "url": "https://pvp.qq.com/web201706/js/newsdata.js", "type": "tencent"},
+    {"name": "和平精英", "url": "https://gp.qq.com/web201908/js/newsdata.js", "type": "tencent"},
+    {"name": "无畏契约", "url": "https://val.qq.com/web202306/js/newsdata.js", "type": "tencent"},
+    {"name": "穿越火线", "url": "https://cf.qq.com/web202004/js/news_data.js", "type": "tencent"},
 ]
 
 KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季", "停服"]
-CHECK_RANGE_HOURS = 72 # 强制检查3天内，确保有内容
+CHECK_RANGE_HOURS = 24  # 检查过去24小时
 
-def fetch_rss(game_name, game_id):
-    for mirror in MIRRORS:
-        url = f"{mirror}/taptap/topic/{game_id}/official"
-        print(f"  正在尝试镜像 {mirror} ...")
-        try:
-            # 增加 User-Agent 伪装
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                feed = feedparser.parse(response.text)
-                if feed.entries:
-                    return feed.entries
-            print(f"  ⚠️ 镜像 {mirror} 返回数据为空或报错")
-        except Exception as e:
-            print(f"  ❌ 镜像 {mirror} 访问失败: {e}")
-    return []
-
-def get_game_updates():
-    summary_list = []
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    for game in GAMES:
-        print(f"正在检查: {game['name']}...")
-        entries = fetch_rss(game['name'], game['id'])
+def get_tencent_news(game):
+    results = []
+    try:
+        # 腾讯的这些 .js 文件其实是封装好的 JSON
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(game['url'], headers=headers)
+        response.encoding = 'gbk' # 腾讯接口通常用 GBK 编码
         
-        if not entries:
-            print(f"  🚫 {game['name']} 所有镜像均失效。")
-            continue
-            
-        print(f"  ✅ 成功获取 {len(entries)} 条公告，正在匹配关键词...")
-        for entry in entries:
-            pub_time = None
-            if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-            
-            if not pub_time: pub_time = now
+        # 提取真正的 JSON 内容
+        content = response.text
+        json_str = content[content.find('{'):content.rfind('}')+1]
+        data = json.loads(json_str)
+        
+        # 遍历新闻列表 (通常在 news_all 字段)
+        news_list = data.get('news_all', [])
+        now = datetime.datetime.now()
 
-            if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
-                if any(kw.lower() in entry.title.lower() for kw in KEYWORDS):
-                    summary_list.append(f"【{game['name']}】{entry.title}\n链接: {entry.link}")
+        for item in news_list:
+            title = item.get('sTitle', '')
+            date_str = item.get('sIdxTime', '') # 格式通常是 2024-05-20 10:00:00
+            # 兼容不同游戏的跳转链接
+            raw_url = item.get('sRedirectURL') or item.get('vLink') or ""
+            link = "https:" + raw_url if raw_url.startswith('//') else raw_url
+
+            if not date_str: continue
             
-    return summary_list
+            pub_time = datetime.datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            
+            # 判断时间范围和关键词
+            if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                if any(kw in title for kw in KEYWORDS):
+                    results.append(f"【{game['name']}】{title}\n链接: {link}")
+    except Exception as e:
+        print(f"❌ 抓取 {game['name']} 失败: {e}")
+    return results
 
 def send_email(content_list, smtp_config):
     if not content_list:
         print("今日无符合条件的更新公告。")
         return
 
-    mail_content = "为您汇总以下游戏更新动态（测试模式）：\n\n" + "\n\n".join(content_list)
+    mail_content = "检测到以下游戏更新：\n\n" + "\n\n".join(content_list)
     msg = MIMEText(mail_content, 'plain', 'utf-8')
     msg['From'] = smtp_config['sender']
     msg['To'] = smtp_config['receiver']
@@ -86,7 +70,7 @@ def send_email(content_list, smtp_config):
         server.login(smtp_config['user'], smtp_config['password'])
         server.sendmail(smtp_config['sender'], [smtp_config['receiver']], msg.as_string())
         server.quit()
-        print("🚀 邮件发送成功！请检查收件箱或垃圾箱。")
+        print("🚀 邮件发送成功！")
     except Exception as e:
         print(f"❌ 邮件发送失败: {e}")
 
@@ -99,5 +83,10 @@ if __name__ == "__main__":
         'sender': os.environ.get('MAIL_USER'),
         'receiver': os.environ.get('MAIL_USER')
     }
-    updates = get_game_updates()
-    send_email(updates, SMTP_CONFIG)
+    
+    all_news = []
+    for game in GAMES:
+        print(f"正在抓取: {game['name']}...")
+        all_news.extend(get_tencent_news(game))
+    
+    send_email(all_news, SMTP_CONFIG)
