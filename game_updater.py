@@ -4,6 +4,7 @@ import smtplib
 import urllib.parse
 import requests
 import re
+import json
 from email.mime.text import MIMEText
 from email.header import Header
 
@@ -52,7 +53,7 @@ def clean_and_filter(items):
         # 1. 黑名单过滤
         if any(word in item['title'] for word in BLACKLIST):
             continue
-        # 2. 标题去重（取前15个字符判断相似度）
+        # 2. 标题相似度去重（取前15个字符）
         title_summary = item['title'][:15]
         if title_summary in seen_titles:
             continue
@@ -63,14 +64,18 @@ def clean_and_filter(items):
 def fetch_from_google(game_name):
     """从 Google News 获取数据"""
     results = []
-    # 增加官方站点权重
-    query = f'{game_name} ("{"\" OR \"".join(KEYWORDS)}")'
+    # 修正 f-string 语法：先在外部处理好关键字查询字符串
+    keyword_query = ' OR '.join(['"{}"'.format(kw) for kw in KEYWORDS])
+    query = '{} ({})'.format(game_name, keyword_query)
+    
     encoded_query = urllib.parse.quote(query)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
     
     try:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries:
+            if not hasattr(entry, 'published_parsed') or not entry.published_parsed:
+                continue
             pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
             if (datetime.datetime.now(datetime.timezone.utc) - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
                 if game_name in entry.title:
@@ -81,29 +86,34 @@ def fetch_from_google(game_name):
                         "time": pub_time,
                         "is_official": is_official(entry.link)
                     })
-    except: pass
+    except Exception as e:
+        print(f"   ⚠️ Google News 抓取失败 ({game_name}): {e}")
     return results
 
 def fetch_from_taptap(game_name, app_id):
     """从 TapTap 官方社区获取数据（作为补充）"""
     results = []
     if not app_id: return results
+    # TapTap 官方公告 API
     url = f"https://www.taptap.cn/web-api/tds-forum/v1/categories/official/topics?app_id={app_id}&limit=5"
     try:
-        resp = requests.get(url, timeout=10).json()
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=10).json()
         items = resp.get('data', {}).get('list', [])
         for item in items:
-            title = item.get('topic', {}).get('title', '')
+            topic_data = item.get('topic', {})
+            title = topic_data.get('title', '')
             if any(kw in title for kw in KEYWORDS):
-                topic_id = item.get('topic', {}).get('id')
+                topic_id = topic_data.get('id')
                 results.append({
                     "title": title,
                     "link": f"https://www.taptap.cn/moment/{topic_id}",
                     "source": "TapTap官方社区",
-                    "time": datetime.datetime.now(datetime.timezone.utc), # 接口时间解析较复杂，暂用当前
+                    "time": datetime.datetime.now(datetime.timezone.utc), 
                     "is_official": True
                 })
-    except: pass
+    except Exception as e:
+        print(f"   ⚠️ TapTap 抓取失败 ({game_name}): {e}")
     return results
 
 # --- 3. 邮件模板生成 ---
@@ -114,48 +124,47 @@ def generate_html(all_data):
     <html>
     <head>
         <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f9; color: #333; }}
-            .container {{ max-width: 650px; margin: 20px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
-            .header {{ background: linear-gradient(135deg, #1a73e8, #0d47a1); color: white; padding: 30px 20px; text-align: center; }}
-            .game-section {{ padding: 20px; border-bottom: 8px solid #f4f7f9; }}
-            .game-title {{ font-size: 20px; font-weight: bold; color: #1a73e8; border-left: 5px solid #1a73e8; padding-left: 10px; margin-bottom: 15px; }}
-            .news-item {{ padding: 12px; margin-bottom: 10px; border-radius: 8px; transition: background 0.3s; background: #fff; border: 1px solid #eee; }}
-            .news-title {{ text-decoration: none; color: #202124; font-weight: 500; font-size: 15px; display: block; }}
-            .news-title:hover {{ color: #1a73e8; }}
-            .badge-official {{ background: #e6f4ea; color: #1e8e3e; font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: bold; margin-right: 5px; }}
-            .meta {{ font-size: 12px; color: #70757a; margin-top: 8px; }}
-            .empty {{ color: #999; font-style: italic; font-size: 14px; padding: 10px; }}
-            .footer {{ background: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #70757a; }}
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; }}
+            .container {{ max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); overflow: hidden; }}
+            .header {{ background: #1a73e8; color: white; padding: 25px; text-align: center; }}
+            .game-section {{ padding: 20px; border-bottom: 1px solid #eee; }}
+            .game-title {{ font-size: 18px; font-weight: bold; color: #1a73e8; margin-bottom: 15px; padding-left: 10px; border-left: 4px solid #1a73e8; }}
+            .news-item {{ display: block; padding: 12px; margin-bottom: 8px; background: #fafafa; border-radius: 6px; text-decoration: none; border: 1px solid #f0f0f0; }}
+            .news-title {{ color: #202124; font-size: 14px; font-weight: 500; display: block; margin-bottom: 5px; }}
+            .badge-official {{ display: inline-block; background: #e6f4ea; color: #1e8e3e; font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-right: 6px; }}
+            .meta {{ font-size: 11px; color: #70757a; }}
+            .empty {{ font-size: 13px; color: #999; padding: 10px; }}
+            .footer {{ padding: 20px; font-size: 11px; color: #999; text-align: center; line-height: 1.5; }}
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1 style="margin:0;">🎮 游戏更新情报精选</h1>
-                <p style="margin:10px 0 0; opacity: 0.8;">北京时间：{get_beijing_time().strftime('%Y-%m-%d %H:%M')}</p>
+                <h2 style="margin:0;">🎮 游戏情报分类简报</h2>
+                <div style="font-size:12px; margin-top:5px; opacity:0.9;">生成时间: {get_beijing_time().strftime('%Y-%m-%d %H:%M')}</div>
             </div>
     """
     
     for game, news in all_data.items():
         html += f'<div class="game-section"><div class="game-title">{game}</div>'
         if not news:
-            html += '<div class="empty">今日暂无重要更新公告</div>'
+            html += '<div class="empty">今日暂无匹配的更新公告</div>'
         else:
             for item in news:
-                official_badge = '<span class="badge-official">官方权威</span>' if item['is_official'] else ''
+                official_badge = '<span class="badge-official">官方</span>' if item['is_official'] else ''
                 rel_time = format_relative_time(item['time'])
                 html += f"""
-                <div class="news-item">
-                    {official_badge}<a class="news-title" href="{item['link']}">{item['title']}</a>
-                    <div class="meta">{item['source']} • {rel_time}</div>
-                </div>
+                <a class="news-item" href="{item['link']}">
+                    <span class="news-title">{official_badge}{item['title']}</span>
+                    <span class="meta">{item['source']} • {rel_time}</span>
+                </a>
                 """
         html += '</div>'
 
     html += """
             <div class="footer">
-                自动化情报系统已开启过滤机制：已剔除攻略、八卦及重复信息<br>
-                由 GitHub Actions 驱动 • 数据源自 Google & TapTap
+                系统已自动排除八卦、爆料及重复信息<br>
+                Powered by GitHub Actions • 数据源：Google News & TapTap
             </div>
         </div>
     </body>
@@ -176,33 +185,33 @@ if __name__ == "__main__":
     all_game_data = {}
 
     for game_name, app_id in GAMES_CONFIG.items():
-        # 1. 从 Google News 获取
+        # 1. 获取 Google 数据
         raw_news = fetch_from_google(game_name)
         
-        # 2. 针对特定游戏或作为补充从 TapTap 获取
-        if len(raw_news) < 2: # 如果 Google 搜到的少，去 TapTap 补货
+        # 2. 如果结果较少，使用 TapTap 补货
+        if len(raw_news) < 2:
             raw_news.extend(fetch_from_taptap(game_name, app_id))
             
-        # 3. 清洗与去重
+        # 3. 过滤与清洗
         filtered_news = clean_and_filter(raw_news)
         
-        # 4. 排序：官方源排在前面
+        # 4. 排序：官方置顶
         filtered_news.sort(key=lambda x: x['is_official'], reverse=True)
         
         all_game_data[game_name] = filtered_news
 
-    # 发送邮件
+    # 5. 生成 HTML 并发送
     html_content = generate_html(all_game_data)
     msg = MIMEText(html_content, 'html', 'utf-8')
     msg['From'] = conf['user']
     msg['To'] = conf['user']
-    msg['Subject'] = Header(f"🎮 游戏更新情报日报 - {datetime.date.today()}", 'utf-8')
+    msg['Subject'] = Header(f"🎮 游戏更新分类情报 - {datetime.date.today()}", 'utf-8')
 
     try:
         server = smtplib.SMTP_SSL(conf['host'], 465, timeout=30)
         server.login(conf['user'], conf['password'])
         server.sendmail(conf['user'], [conf['user']], msg.as_string())
         server.quit()
-        print("🚀 成功发送分类精选报告！")
+        print("🚀 分类情报日报发送成功！")
     except Exception as e:
-        print(f"❌ 发送失败: {e}")
+        print(f"❌ 邮件发送失败: {e}")
