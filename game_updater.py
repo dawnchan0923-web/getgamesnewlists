@@ -17,7 +17,7 @@ GAMES = [
 
 # --- 2. 过滤配置 ---
 KEYWORDS = ["更新", "维护", "版本", "公告", "Season", "赛季"]
-CHECK_RANGE_HOURS = 24  # 只获取过去24小时内的公告
+CHECK_RANGE_HOURS = 240  # 只获取过去24小时内的公告
 
 def get_game_updates():
     summary_list = []
