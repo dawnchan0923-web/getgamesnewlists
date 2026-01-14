@@ -1,78 +1,57 @@
-import requests
+import feedparser
 import datetime
 import smtplib
-import time
+import urllib.parse
 from email.mime.text import MIMEText
 from email.header import Header
 
-# --- 1. 配置：游戏官号的微博 UID ---
-# 获取方式：手机网页版微博进入官号主页，URL里的数字即 UID
-GAMES = [
-    {"name": "王者荣耀", "uid": "5698024830", "containerid": "1076035698024830"},
-    {"name": "和平精英", "uid": "6512318439", "containerid": "1076036512318439"},
-    {"name": "无畏契约", "uid": "7490218706", "containerid": "1076037490218706"},
-    {"name": "穿越火线", "uid": "1888365260", "containerid": "1076031888365260"},
-    {"name": "第五人格", "uid": "6140485607", "containerid": "1076036140485607"},
-    {"name": "超自然行动", "uid": "7922246752", "containerid": "1076037922246752"},
-]
+# --- 1. 配置：需要监控的游戏列表 ---
+GAMES = ["王者荣耀", "和平精英", "无畏契约", "穿越火线", "第五人格", "超自然行动"]
 
-KEYWORDS = ["更新", "维护", "版本", "公告", "赛季", "停服"]
-CHECK_RANGE_HOURS = 48  # 检查过去 48 小时
+# 关键词组合
+KEYWORDS = ["更新", "维护", "公告", "版本", "赛季"]
+CHECK_RANGE_HOURS = 24  # 每天检查一次
 
-def get_weibo_news(game):
+def get_google_news_updates():
     results = []
-    print(f"🔍 正在检查微博官号: {game['name']}...")
-    try:
-        # 微博移动端 API
-        url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={game['uid']}&containerid={game['containerid']}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
-            'Referer': 'https://m.weibo.cn/'
-        }
+    now = datetime.datetime.now(datetime.timezone.utc)
+    
+    for game in GAMES:
+        print(f"🔍 正在通过 Google News 检索: {game}...")
         
-        # 增加重试机制
-        response = requests.get(url, headers=headers, timeout=20)
-        if response.status_code != 200:
-            print(f"   ❌ 请求失败，状态码: {response.status_code}")
-            return []
-
-        data = response.json()
-        cards = data.get('data', {}).get('cards', [])
-        print(f"   ✅ 成功连通！获取到 {len(cards)} 条博文记录")
-
-        now = datetime.datetime.now()
-        for card in cards:
-            mblog = card.get('mblog')
-            if not mblog: continue
+        # 构造搜索关键词：游戏名 + (关键词1 OR 关键词2...)
+        query = f'{game} ("{"\" OR \"".join(KEYWORDS)}")'
+        encoded_query = urllib.parse.quote(query)
+        
+        # Google News RSS 接口 (全球最稳的数据源)
+        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+        
+        try:
+            feed = feedparser.parse(rss_url)
+            print(f"   ✅ 检索到 {len(feed.entries)} 条相关快讯")
             
-            # 获取内容
-            text = mblog.get('text', '')
-            # 获取时间
-            created_at = mblog.get('created_at')
-            # 获取链接
-            bid = mblog.get('bid')
-            link = f"https://weibo.com/{game['uid']}/{bid}"
-
-            # 过滤逻辑
-            if any(kw in text for kw in KEYWORDS):
-                # 微博时间格式比较特殊，简单处理：只要在列表中且含关键词就视为近期动态
-                # 因为接口返回的本来就是最新的前10条
-                clean_text = "".join(re.findall(r'[\u4e00-\u9fa5]+', text))[:50] # 只取前50个汉字作为摘要
-                results.append(f"【{game['name']}】{clean_text}...\n链接: {link}")
+            count = 0
+            for entry in feed.entries:
+                # 解析发布时间
+                pub_time = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
                 
-    except Exception as e:
-        print(f"   ❌ 抓取失败: {e}")
-        
-    return list(set(results))
-
-import re # 别忘了导入正则
+                # 只取过去 24 小时内的，且标题里确实含有游戏名的
+                if (now - pub_time).total_seconds() / 3600 < CHECK_RANGE_HOURS:
+                    if game in entry.title:
+                        results.append(f"【{game}】{entry.title}\n来源: {entry.source.get('title', '未知')}\n链接: {entry.link}")
+                        count += 1
+            print(f"   ✨ 筛选出 {count} 条最新公告")
+        except Exception as e:
+            print(f"   ❌ 检索失败: {e}")
+            
+    return list(set(results)) # 去重
 
 def send_email(content_list, smtp):
     if not content_list:
-        print("\n📢 结果：微博接口通畅，但过去 48 小时无匹配关键词的博文。")
+        print("\n📢 结果：今日暂无最新的游戏更新公告。")
         return
     
-    body = "游戏更新自动监控报告（数据源：微博官号）：\n\n" + "\n\n".join(content_list)
+    body = "您关注的游戏更新汇总（来源：Google News 聚合）：\n\n" + "\n\n".join(content_list)
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['From'] = smtp['user']
     msg['To'] = smtp['user']
@@ -83,7 +62,7 @@ def send_email(content_list, smtp):
         s.login(smtp['user'], smtp['password'])
         s.sendmail(smtp['user'], [smtp['user']], msg.as_string())
         s.quit()
-        print("\n🚀 邮件已成功发送！")
+        print("\n🚀 邮件已成功发送至您的邮箱！")
     except Exception as e:
         print(f"\n❌ 邮件发送失败: {e}")
 
@@ -95,9 +74,5 @@ if __name__ == "__main__":
         'password': os.environ.get('MAIL_PASS')
     }
     
-    all_news = []
-    for g in GAMES:
-        all_news.extend(get_weibo_news(g))
-        time.sleep(2) # 稍微停顿，防止被微博识别为攻击
-    
-    send_email(all_news, conf)
+    updates = get_google_news_updates()
+    send_email(updates, conf)
